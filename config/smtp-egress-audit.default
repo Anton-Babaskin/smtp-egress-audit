@@ -1,0 +1,8 @@
+# smtp-egress-audit defaults
+LOG_ROOT=/var/log/smtp-egress-audit
+SMTP_PORT=25
+SINCE="24 hours ago"
+SAMPLE_INTERVAL=1
+ACTIVE_THRESHOLD=10
+INTERFACE=auto
+RESOLVE_HOSTNAMES=1

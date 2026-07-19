@@ -1,0 +1,7 @@
+-Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------
+A1B2C3D4*      1234 Sun Jul 19 10:00:00  sender@example.com
+                                         user@example.net
+B2C3D4E5!      2345 Sun Jul 19 10:01:00  sender@example.com
+                                         user@example.org
+
+-- 3 Kbytes in 2 Requests.

@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly VERSION="1.1.0"
+readonly PROGRAM="smtp-egress-audit"
+
+: "${LOG_ROOT:=/var/log/smtp-egress-audit}"
+: "${SMTP_PORT:=25}"
+: "${SINCE:=24 hours ago}"
+: "${SAMPLE_INTERVAL:=1}"
+: "${ACTIVE_THRESHOLD:=10}"
+: "${INTERFACE:=auto}"
+: "${RESOLVE_HOSTNAMES:=1}"
+
+RUN_DIR=""
+REPORT_FILE=""
+TCPDUMP_PID=""
+BPF_PID=""
+STOP_REQUESTED=0
+
+have() { command -v "$1" >/dev/null 2>&1; }
+note() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+heading() { printf '\n== %s ==\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  smtp-egress-audit audit
+  smtp-egress-audit report
+  smtp-egress-audit watch [seconds]
+  smtp-egress-audit monitor
+  smtp-egress-audit --help
+  smtp-egress-audit --version
+
+Read-only audit and monitoring of outbound SMTP connections.
+
+Environment:
+  LOG_ROOT=/var/log/smtp-egress-audit  SMTP_PORT=25
+  SINCE="24 hours ago"                 SAMPLE_INTERVAL=1
+  ACTIVE_THRESHOLD=10                 INTERFACE=auto
+  RESOLVE_HOSTNAMES=1
+EOF
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_positive_number() { [[ "$1" =~ ^([0-9]+)([.][0-9]+)?$ ]] && awk -v n="$1" 'BEGIN { exit !(n > 0) }'; }
+
+validate_environment() {
+    if ! is_uint "$SMTP_PORT" || (( SMTP_PORT < 1 || SMTP_PORT > 65535 )); then
+        die "SMTP_PORT must be an integer from 1 to 65535"
+    fi
+    is_positive_number "$SAMPLE_INTERVAL" || die "SAMPLE_INTERVAL must be a positive number"
+    is_uint "$ACTIVE_THRESHOLD" || die "ACTIVE_THRESHOLD must be a non-negative integer"
+    [[ "$RESOLVE_HOSTNAMES" == 0 || "$RESOLVE_HOSTNAMES" == 1 ]] || die "RESOLVE_HOSTNAMES must be 0 or 1"
+    [[ -n "$SINCE" && "$SINCE" != *$'\n'* ]] || die "SINCE must be a non-empty single-line value"
+    [[ "$INTERFACE" =~ ^[[:alnum:]_.:@-]+$ ]] || die "INTERFACE contains invalid characters"
+    [[ "$LOG_ROOT" == /* && "$LOG_ROOT" != / && "$LOG_ROOT" != *$'\n'* ]] || die "LOG_ROOT must be an absolute path other than /"
+}
+
+validate_duration() {
+    if ! is_uint "$1" || (( $1 < 1 || $1 > 604800 )); then
+        die "watch duration must be an integer from 1 to 604800 seconds"
+    fi
+}
+
+tcpdump_filter() {
+    local port="${1:-$SMTP_PORT}"
+    if ! is_uint "$port" || (( port < 1 || port > 65535 )); then return 2; fi
+    printf 'tcp dst port %s and (tcp[tcpflags] & tcp-syn != 0)\n' "$port"
+}
+
+redact_sensitive() {
+    sed -E \
+        -e '/(^|[^[:alnum:]_])(pass(word)?|secret|token|api[_-]?key|private[_-]?key)[^=]*=/I s#=.*#= [REDACTED]#' \
+        -e 's#(://[^/@:[:space:]]+):[^/@[:space:]]+@#\1:[REDACTED]@#g'
+}
+
+redact_postconf() {
+    awk '
+        BEGIN { IGNORECASE=1 }
+        /^[[:space:]]*#/ { print; next }
+        /^[^=]*(password_maps|password|secret|token|private_key)[^=]*=/ {
+            key=$0; sub(/[[:space:]]*=.*/, "", key); print key " = configured"; next
+        }
+        { gsub(/:\/\/[^\/@:[:space:]]+:[^\/@[:space:]]+@/, "://[REDACTED]:[REDACTED]@"); print }
+    '
+}
+
+count_postfix_status() { awk -v s="$1" 'index($0, "status=" s) { n++ } END { print n+0 }'; }
+extract_sasl_usernames() {
+    sed -nE 's/.*sasl_username=([^,[:space:]]+).*/\1/p' | sort | uniq -c | sort -nr
+}
+extract_smtp_auth() {
+    sed -nE 's/.*client=([^[]+)\[([0-9A-Fa-f:.]+)\].*sasl_method=([^,]+), sasl_username=([^,[:space:]]+).*/\4 \2 \1 \3/p'
+}
+extract_ssh_success() {
+    sed -nE 's/.*Accepted (publickey|password|keyboard-interactive[^ ]*) for ([^ ]+) from ([0-9A-Fa-f:.]+).*/\2 \3 \1/p'
+}
+extract_dovecot_success() {
+    sed -nE 's/.*dovecot: ([^(: ]+).*Login:.*user=<([^>]*)>.*rip=([^, >]+).*/\2 \3 \1/p'
+}
+postqueue_count() {
+    awk '
+      /Mail queue is empty/ { empty=1 }
+      /^[A-F0-9*!]+[[:space:]]/ { n++ }
+      END { if (empty) print 0; else print n+0 }
+    '
+}
+
+init_run() {
+    local mode="$1" stamp
+    umask 077
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    RUN_DIR="${LOG_ROOT%/}/${stamp}-${mode}-$$"
+    mkdir -p -- "$RUN_DIR" || die "cannot create $RUN_DIR (run as root or set LOG_ROOT)"
+    chmod 700 "$RUN_DIR"
+    REPORT_FILE="$RUN_DIR/report.txt"
+    : >"$REPORT_FILE"
+    chmod 600 "$REPORT_FILE"
+    exec > >(tee -a "$REPORT_FILE") 2>&1
+    note "$PROGRAM $VERSION | mode=$mode | port=$SMTP_PORT | since=$SINCE"
+    note "Report directory: $RUN_DIR"
+    note "Safety: metadata only; no packet payload or message bodies are captured."
+}
+
+run_or_unavailable() {
+    local cmd="$1"; shift
+    if have "$cmd"; then "$cmd" "$@" 2>&1 || note "$cmd: unavailable or permission denied"; else note "$cmd: not installed"; fi
+}
+
+service_summary() {
+    local unit
+    if ! have systemctl; then note "systemctl: unavailable"; return; fi
+    for unit in postfix ssh sshd dovecot fail2ban docker podman; do
+        if systemctl cat "$unit" >/dev/null 2>&1; then
+            printf '%-12s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
+        fi
+    done
+}
+
+collect_journal_or_file() {
+    local kind="$1" output="$2" data=""
+    if have journalctl; then
+        case "$kind" in
+            mail) data="$(journalctl --since "$SINCE" --no-pager -o short-iso -u postfix -u dovecot 2>/dev/null || true)" ;;
+            auth) data="$(journalctl --since "$SINCE" --no-pager -o short-iso -u ssh -u sshd -t sudo -t su 2>/dev/null || true)" ;;
+        esac
+    fi
+    local relevant=0
+    case "$kind" in
+        mail) grep -Eq 'postfix/|dovecot:' <<<"$data" && relevant=1 || true ;;
+        auth) grep -Eq 'sshd\[[0-9]+\]: (Accepted|Failed|Invalid)|sudo(\[[0-9]+\])?:|su(\[[0-9]+\])?:' <<<"$data" && relevant=1 || true ;;
+    esac
+    if (( relevant )); then
+        printf '%s\n' "$data" >"$output"
+        return
+    fi
+    local candidate
+    case "$kind" in
+        mail) for candidate in /var/log/mail.log /var/log/maillog; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; return; }; done ;;
+        auth) for candidate in /var/log/auth.log /var/log/secure; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; return; }; done ;;
+    esac
+    : >"$output"
+    note "$kind logs: unavailable for SINCE=$SINCE"
+}
+
+parse_sshd_port() { awk '$1 == "port" && $2 ~ /^[0-9]+$/ { print $2; exit }'; }
+
+effective_ssh_port() {
+    local port=""
+    if have sshd; then port="$(sshd -T 2>/dev/null | parse_sshd_port || true)"; fi
+    if [[ -z "$port" && -r /etc/ssh/sshd_config ]]; then
+        port="$(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ { print $2; exit }' /etc/ssh/sshd_config)"
+    fi
+    printf '%s\n' "${port:-22}"
+}
+
+resolve_ptr() {
+    local ip="$1" result=""
+    [[ "$RESOLVE_HOSTNAMES" == 1 ]] || { printf '%s' "disabled"; return; }
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || { printf '%s' "invalid-ip"; return; }
+    if have getent; then
+        if have timeout; then result="$(timeout 2 getent hosts "$ip" 2>/dev/null | awk 'NR==1 {print $2}' || true)";
+        else result="$(getent hosts "$ip" 2>/dev/null | awk 'NR==1 {print $2}' || true)"; fi
+    fi
+    printf '%s' "${result:-unresolved}"
+}
+
+print_login_rows_with_ptr() {
+    local user ip method
+    while read -r user ip method; do
+        [[ -n "${user:-}" ]] || continue
+        printf '%s user=%s ip=%s ptr=%s method=%s\n' "login" "$user" "$ip" "$(resolve_ptr "$ip")" "$method"
+    done
+}
+
+postfix_report() {
+    local log="$1" queue_file="$RUN_DIR/postqueue.txt"
+    heading "Postfix delivery summary"
+    printf 'status=sent:     %s\n' "$(count_postfix_status sent <"$log")"
+    printf 'status=deferred: %s\n' "$(count_postfix_status deferred <"$log")"
+    printf 'status=bounced:  %s\n' "$(count_postfix_status bounced <"$log")"
+    printf 'queued messages: %s\n' "$(awk '/postfix\/(smtpd|pickup).*: [A-F0-9]+: (client=|uid=)/ {n++} END{print n+0}' "$log")"
+
+    heading "Postfix queue"
+    if have postqueue; then postqueue -p >"$queue_file" 2>&1 || true; cat "$queue_file"; printf 'Queue entries counted: %s\n' "$(postqueue_count <"$queue_file")"; else note "postqueue: not installed"; fi
+
+    heading "Recent delivery events (metadata only)"
+    awk '/postfix\/smtp.*status=(sent|deferred|bounced)/ { print }' "$log" | tail -n 30 || true
+
+    heading "Top recipient domains"
+    sed -nE 's/.*to=<[^@>]+@([^>]+)>.*/\1/p' "$log" | tr '[:upper:]' '[:lower:]' | sort | uniq -c | sort -nr | head -20 || true
+
+    heading "Outbound relay endpoints"
+    sed -nE 's/.* relay=([^,[:space:]]+).*/\1/p' "$log" | sort | uniq -c | sort -nr | head -20 || true
+
+    heading "Authenticated SMTP users"
+    extract_sasl_usernames <"$log" | head -30 || true
+
+    heading "SMTP client hostname and IP"
+    sed -nE 's/.*client=([^,]+).*/\1/p' "$log" | sort | uniq -c | sort -nr | head -30 || true
+
+    heading "Rejected relay attempts"
+    grep -F 'Relay access denied' "$log" | tail -30 || true
+    printf 'Rejected relay attempts: %s\n' "$(grep -Fc 'Relay access denied' "$log" || true)"
+
+    heading "SASL authentication failures"
+    grep -Ei 'SASL.*authentication failed|authentication failure' "$log" | tail -30 || true
+
+    heading "Postfix status and processes"
+    service_summary | grep -E '^postfix|^dovecot' || true
+    if have pgrep; then pgrep -a -f '[p]ostfix/(master|smtp|smtpd|qmgr|pickup)|/usr/lib/[p]ostfix|/usr/libexec/[p]ostfix' || note "No Postfix processes observed"; else note "pgrep: not installed"; fi
+
+    heading "Active TCP connections to destination port $SMTP_PORT"
+    snapshot_ss
+
+    heading "Non-default Postfix configuration (secrets redacted)"
+    if have postconf; then postconf -n 2>&1 | redact_postconf || note "postconf: unavailable or permission denied"; else note "postconf: not installed"; fi
+}
+
+linux_login_report() {
+    local log="$1" ssh_port
+    ssh_port="$(effective_ssh_port)"
+    heading "Current users"
+    run_or_unavailable who
+    run_or_unavailable w
+
+    heading "Login history"
+    run_or_unavailable last -n 30
+    run_or_unavailable lastlog
+
+    heading "Established SSH connections"
+    note "SSH port: $ssh_port"
+    if have ss; then ss -Htnp state established 2>&1 | awk -v suffix=":$ssh_port" 'index($4, suffix) == length($4)-length(suffix)+1 || index($5, suffix) == length($5)-length(suffix)+1 {print}' || note "ss: unavailable or permission denied"; else note "ss: not installed"; fi
+
+    heading "Effective SSH server settings"
+    if have sshd; then sshd -T 2>&1 | awk '$1=="port" || $1=="permitrootlogin" || $1=="passwordauthentication"' || note "sshd: unavailable or configuration invalid"; else note "sshd: not installed"; fi
+
+    heading "Successful SSH logins"
+    extract_ssh_success <"$log" | tee "$RUN_DIR/ssh-success.txt" | tail -30 | print_login_rows_with_ptr || true
+    heading "Top failed SSH source IPs"
+    sed -nE 's/.*(Failed password|Invalid user).* from ([0-9A-Fa-f:.]+).*/\2/p' "$log" | sort | uniq -c | sort -nr | head -20 || true
+    heading "Recent SSH authentication errors"
+    grep -Ei 'Failed password|Invalid user|authentication failure' "$log" | tail -30 || true
+    heading "sudo and su events"
+    grep -Ei '(^|[[:space:]])(sudo|su)(\[[0-9]+\])?:' "$log" | tail -30 | redact_sensitive || true
+
+    heading "Fail2ban"
+    if have fail2ban-client; then fail2ban-client status 2>&1 || true; fail2ban-client status sshd 2>&1 || note "Fail2ban sshd jail unavailable"; else note "fail2ban-client: not installed"; fi
+}
+
+mail_login_report() {
+    local log="$1"
+    heading "Successful SMTP Submission/SASL logins"
+    extract_smtp_auth <"$log" | awk '{printf "login user=%s ip=%s client=%s method=%s\n", $1, $2, $3, $4}' | tail -30 || true
+    heading "SMTP users and source IPs grouped"
+    extract_smtp_auth <"$log" | awk '{print $1, $2}' | sort | uniq -c | sort -nr | head -30 || true
+
+    heading "Successful Dovecot IMAP/POP3 logins"
+    extract_dovecot_success <"$log" | tee "$RUN_DIR/dovecot-success.txt" | tail -30 | print_login_rows_with_ptr || true
+    heading "Dovecot users and IPs grouped"
+    extract_dovecot_success <"$log" | awk '{print $1, $2}' | sort | uniq -c | sort -nr | head -30 || true
+    heading "Top failed mail authentication source IPs"
+    {
+        sed -nE '/auth failed|Authentication failure|Aborted login/I s/.*rip=([^, >]+).*/\1/p' "$log"
+        sed -nE '/SASL.*authentication failed/I s/.*\[([0-9A-Fa-f:.]+)\].*/\1/p' "$log"
+    } | sort | uniq -c | sort -nr | head -20 || true
+    heading "Recent mail authentication errors"
+    grep -Ei 'auth failed|Authentication failure|Aborted login|SASL.*authentication failed' "$log" | tail -30 || true
+}
+
+snapshot_ss() {
+    if ! have ss; then note "ss: not installed"; return; fi
+    ss -Htanp 2>&1 | awk -v p="$SMTP_PORT" '
+      function port(endpoint, x) { x=endpoint; sub(/^.*]:/, "", x); sub(/^.*:/, "", x); return x }
+      port($5) == p { print }
+    ' || true
+}
+
+system_audit() {
+    heading "Host and time"
+    printf 'hostname: %s\n' "$(hostname 2>/dev/null || note unavailable)"
+    printf 'fqdn: %s\n' "$(hostname -f 2>/dev/null || note unavailable)"
+    run_or_unavailable date --iso-8601=seconds
+    if have timedatectl; then timedatectl 2>&1 | sed -n '1,8p' || note "timedatectl: unavailable"; else note "timedatectl: not installed"; fi
+    run_or_unavailable uptime
+
+    heading "Reboot history"
+    if have last; then last reboot -n 20 2>&1 || note "reboot history: unavailable"; else note "last: not installed"; fi
+    heading "IP addresses"
+    run_or_unavailable ip -brief address
+    heading "Routes"
+    run_or_unavailable ip route show
+    heading "Relevant services"
+    service_summary
+    heading "Mail transfer agent processes"
+    if have pgrep; then pgrep -a -f '([p]ostfix|[e]xim|[s]endmail)' || note "No Postfix, Exim, or Sendmail processes observed"; else note "pgrep: not installed"; fi
+
+    heading "Cron jobs (sensitive assignments redacted)"
+    if have crontab; then crontab -l 2>&1 | redact_sensitive || true; else note "crontab: not installed"; fi
+    if [[ -d /etc/cron.d ]]; then find /etc/cron.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || note "cron.d listing: unavailable"; fi
+    heading "Systemd timers"
+    run_or_unavailable systemctl list-timers --all --no-pager
+
+    heading "Containers"
+    if have docker; then docker ps --no-trunc 2>&1 || note "docker: unavailable or permission denied"; else note "docker: not installed"; fi
+    if have podman; then podman ps --no-trunc 2>&1 || note "podman: unavailable or permission denied"; else note "podman: not installed"; fi
+
+    heading "Conntrack entries for destination port $SMTP_PORT"
+    if have conntrack; then conntrack -L -p tcp --dport "$SMTP_PORT" 2>&1 || note "conntrack: unavailable or permission denied"; else note "conntrack: not installed"; fi
+}
+
+detect_interface() {
+    if [[ "$INTERFACE" != auto ]]; then printf '%s\n' "$INTERFACE"; return; fi
+    local detected=""
+    if have ip; then
+        detected="$(ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' || true)"
+    fi
+    printf '%s\n' "${detected:-any}"
+}
+
+tcpdump_supports_direction() { tcpdump --help 2>&1 | grep -Eq -- '(^|[[:space:]])-Q([[:space:]]|,|$)'; }
+
+cleanup_monitor() {
+    STOP_REQUESTED=1
+    local pid
+    for pid in "$TCPDUMP_PID" "$BPF_PID"; do
+        [[ -n "$pid" ]] || continue
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+start_capture() {
+    local iface="$1" capture="$RUN_DIR/tcpdump-syn.log" filter
+    filter="$(tcpdump_filter)"
+    : >"$capture"
+    if have tcpdump; then
+        local -a args=(-l -nn -tt -s 96 -i "$iface")
+        if tcpdump_supports_direction; then
+            args+=(-Q out)
+            note "tcpdump direction filter: -Q out"
+        else
+            local addresses="" address source_filter=""
+            if have ip; then
+                if [[ "$iface" == any ]]; then
+                    addresses="$(ip -o address show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' || true)"
+                else
+                    addresses="$(ip -o address show dev "$iface" scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' || true)"
+                fi
+            fi
+            while read -r address; do
+                [[ "$address" =~ ^[0-9A-Fa-f:.]+$ ]] || continue
+                [[ -n "$source_filter" ]] && source_filter+=" or "
+                source_filter+="src host $address"
+            done <<<"$addresses"
+            if [[ -z "$source_filter" ]]; then
+                warn "tcpdump lacks -Q out and no local source addresses were found; refusing ambiguous capture"
+            else
+                filter="$filter and ($source_filter)"
+                note "tcpdump -Q out unsupported; local source-address BPF enforces outbound direction"
+            fi
+        fi
+        if tcpdump_supports_direction || [[ "$filter" == *'src host '* ]]; then
+            note "tcpdump interface: $iface"
+            note "BPF: $filter"
+            tcpdump "${args[@]}" "$filter" >"$capture" 2>"$RUN_DIR/tcpdump.stderr" &
+            TCPDUMP_PID=$!
+        fi
+    else
+        note "tcpdump: not installed; SYN capture unavailable"
+    fi
+
+    if have tcpconnect-bpfcc; then
+        note "tcpconnect-bpfcc: enabled as supplemental process attribution"
+        tcpconnect-bpfcc -P "$SMTP_PORT" >"$RUN_DIR/tcpconnect-bpfcc.log" 2>"$RUN_DIR/tcpconnect-bpfcc.stderr" &
+        BPF_PID=$!
+    else
+        note "tcpconnect-bpfcc: not installed (optional)"
+    fi
+}
+
+monitor_loop() {
+    local duration="${1:-}" iface start now active
+    iface="$(detect_interface)"; [[ -n "$iface" ]] || iface=any
+    trap cleanup_monitor INT TERM EXIT
+    start_capture "$iface"
+    : >"$RUN_DIR/ss-snapshots.log"
+    start=$SECONDS
+    while (( STOP_REQUESTED == 0 )); do
+        now="$(date --iso-8601=seconds 2>/dev/null || date)"
+        if have ss; then
+            {
+                printf -- '-- %s --\n' "$now"
+                snapshot_ss
+            } >>"$RUN_DIR/ss-snapshots.log"
+            active="$(snapshot_ss | awk 'NF {n++} END{print n+0}')"
+            if (( active > ACTIVE_THRESHOLD )); then warn "$active active connections to destination port $SMTP_PORT exceed threshold $ACTIVE_THRESHOLD"; fi
+        else
+            active=0
+        fi
+        printf '\r%s active=%s elapsed=%ss' "$now" "$active" "$((SECONDS-start))"
+        if [[ -n "$duration" ]] && (( SECONDS - start >= duration )); then break; fi
+        sleep "$SAMPLE_INTERVAL"
+    done
+    printf '\n'
+    cleanup_monitor
+    trap - INT TERM EXIT
+    monitor_summary
+}
+
+monitor_summary() {
+    local capture="$RUN_DIR/tcpdump-syn.log"
+    heading "Network monitoring summary"
+    if [[ -s "$capture" ]]; then
+        printf 'Outbound SYN observed: %s\n' "$(awk 'NF {n++} END{print n+0}' "$capture")"
+        note "Destination IP:port counts:"
+        awk '/ > / {dest=$5; sub(/:$/, "", dest); print dest}' "$capture" | sort | uniq -c | sort -nr
+    else
+        note "Outbound SYN observed: 0 (or tcpdump unavailable/insufficient privileges)"
+    fi
+    note "Observed socket processes:"
+    if [[ -s "$RUN_DIR/ss-snapshots.log" ]]; then
+        sed -nE 's/.*users:\(\("([^"]+)".*pid=([0-9]+).*/\1 pid=\2/p' "$RUN_DIR/ss-snapshots.log" | sort | uniq -c | sort -nr || true
+    else
+        note "none"
+    fi
+    [[ -s "$RUN_DIR/tcpdump.stderr" ]] && { note "tcpdump diagnostics:"; tail -20 "$RUN_DIR/tcpdump.stderr"; } || true
+}
+
+run_report() {
+    local mail_log="$RUN_DIR/mail.log" auth_log="$RUN_DIR/auth.log"
+    collect_journal_or_file mail "$mail_log"
+    collect_journal_or_file auth "$auth_log"
+    postfix_report "$mail_log"
+    linux_login_report "$auth_log"
+    mail_login_report "$mail_log"
+    heading "Interpretation reminder"
+    note "NOQUEUE: reject / Relay access denied normally records a rejected inbound attempt."
+    note "postfix/smtp with status=sent records a completed outbound delivery."
+    note "sasl_username identifies the authenticated mail account."
+}
+
+main() {
+    umask 077
+    validate_environment
+    (( $# >= 1 )) || { usage; exit 2; }
+    case "$1" in
+        --help|-h) (( $# == 1 )) || die "--help takes no arguments"; usage ;;
+        --version|-V) (( $# == 1 )) || die "--version takes no arguments"; printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+        audit) (( $# == 1 )) || die "audit takes no arguments"; init_run audit; system_audit; run_report ;;
+        report) (( $# == 1 )) || die "report takes no arguments"; init_run report; run_report ;;
+        watch) (( $# <= 2 )) || die "watch accepts at most one duration"; local duration="${2:-600}"; validate_duration "$duration"; init_run watch; monitor_loop "$duration" ;;
+        monitor) (( $# == 1 )) || die "monitor takes no arguments"; init_run monitor; monitor_loop ;;
+        *) die "unknown command: $1" ;;
+    esac
+}
+
+if [[ "${SMTP_EGRESS_AUDIT_LIBRARY:-0}" != 1 ]]; then main "$@"; fi

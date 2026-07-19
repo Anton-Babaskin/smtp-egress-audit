@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic outbound SMTP audit report
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/smtp-egress-audit
+ExecStart=/usr/local/sbin/smtp-egress-audit report
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/log/smtp-egress-audit

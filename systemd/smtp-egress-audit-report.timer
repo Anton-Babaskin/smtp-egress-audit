@@ -1,0 +1,11 @@
+[Unit]
+Description=Run smtp-egress-audit report daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=smtp-egress-audit-report.service
+
+[Install]
+WantedBy=timers.target

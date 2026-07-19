@@ -1,0 +1,6 @@
+Jul 19 10:00:01 mx postfix/smtpd[100]: A1B2C3D4: client=mail.example.com[192.0.2.10], sasl_method=PLAIN, sasl_username=alice@example.com
+Jul 19 10:00:02 mx postfix/smtp[101]: A1B2C3D4: to=<bob@example.net>, relay=mx.example.net[198.51.100.20]:25, status=sent (250 2.0.0 queued)
+Jul 19 10:01:02 mx postfix/smtp[102]: B2C3D4E5: to=<ops@example.org>, relay=none, status=deferred (connect timed out)
+Jul 19 10:02:02 mx postfix/smtp[103]: C3D4E5F6: to=<nobody@example.net>, relay=mx.example.net[198.51.100.20]:25, status=bounced (host rejected)
+Jul 19 10:03:02 mx postfix/smtpd[104]: NOQUEUE: reject: RCPT from unknown[192.0.2.44]: 454 4.7.1 Relay access denied
+Jul 19 10:04:02 mx postfix/smtpd[105]: warning: unknown[192.0.2.55]: SASL LOGIN authentication failed

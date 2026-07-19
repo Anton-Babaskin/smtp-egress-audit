@@ -1,0 +1,20 @@
+[Unit]
+Description=Continuous outbound SMTP connection monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/smtp-egress-audit
+ExecStart=/usr/local/sbin/smtp-egress-audit monitor
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/log/smtp-egress-audit
+
+[Install]
+WantedBy=multi-user.target

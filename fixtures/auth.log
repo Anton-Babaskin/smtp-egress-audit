@@ -1,0 +1,3 @@
+Jul 19 10:00:00 host sshd[200]: Accepted publickey for deploy from 192.0.2.10 port 4242 ssh2
+Jul 19 10:01:00 host sshd[201]: Accepted password for admin from 198.51.100.20 port 5252 ssh2
+Jul 19 10:02:00 host sshd[202]: Failed password for invalid user test from 192.0.2.44 port 2222 ssh2
