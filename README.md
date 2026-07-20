@@ -1,8 +1,23 @@
-# smtp-egress-audit
+<div align="center">
 
-## Quick Start
+# 📡 SMTP Egress Audit
 
-Provider reported excessive outbound TCP/25 connections? Install and start the guided read-only investigation:
+### Find what is really opening outbound SMTP connections
+
+<img src="https://img.shields.io/badge/version-1.2.0-7c3aed?style=for-the-badge" alt="Version 1.2.0">
+<img src="https://img.shields.io/badge/evidence-read--only-16a34a?style=for-the-badge" alt="Read-only evidence">
+<img src="https://img.shields.io/badge/payloads-never%20captured-0f766e?style=for-the-badge" alt="No payload capture">
+<img src="https://img.shields.io/github/license/Anton-Babaskin/smtp-egress-audit?style=for-the-badge&color=0ea5e9" alt="License">
+
+<a href="#-quick-start">Quick Start</a> · <a href="#interactive-provider-alert-assistant">Assistant</a> · <a href="#commands">Commands</a> · <a href="docs/README.ru.md">Русская документация</a>
+
+</div>
+
+---
+
+## ⚡ Quick Start
+
+Provider reported excessive outbound TCP/25 connections? Start a guided, bounded investigation:
 
 ```bash
 git clone https://github.com/Anton-Babaskin/smtp-egress-audit.git
@@ -11,13 +26,10 @@ sudo ./install.sh
 sudo smtp-egress-audit
 ```
 
-The assistant asks for the port, log window, and observation time, then prints a compact assessment and the private evidence directory. It does not block addresses, stop services, or change mail configuration.
+> [!IMPORTANT]
+> The tool collects metadata and builds private evidence. It does not block IPs, stop services, rewrite Postfix, or capture message bodies and packet payloads.
 
-`smtp-egress-audit` is a read-only Bash tool for investigating abnormal outbound SMTP connection alerts on Linux servers. It correlates outbound TCP SYN metadata, active sockets and owning processes, Postfix delivery records, authenticated mail users, SSH/Dovecot logins, queues, services, scheduled jobs, containers, and relevant configuration.
-
-The tool never changes firewall, Postfix, SSH, or Fail2ban configuration; never blocks an address; and never captures packet payloads or message bodies.
-
-Version: **1.2.0** · License: MIT · [Русская документация](docs/README.ru.md)
+**What gets correlated:** sockets and PIDs, TCP SYN metadata, Postfix delivery records, SASL users, logins, queues, jobs, containers and relevant configuration.
 
 ## Supported systems and requirements
 
@@ -209,3 +221,4 @@ Reports are preserved. Remove them only with the explicit destructive option:
 ```bash
 sudo ./uninstall.sh --purge-logs
 ```
+
