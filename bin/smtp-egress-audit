@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly PROGRAM="smtp-egress-audit"
 
 : "${LOG_ROOT:=/var/log/smtp-egress-audit}"
@@ -17,6 +17,10 @@ REPORT_FILE=""
 TCPDUMP_PID=""
 BPF_PID=""
 STOP_REQUESTED=0
+CAPTURE_STATUS="not-started"
+CAPTURE_PROCESS_SEEN=0
+SOCKET_CAPTURE_STATUS="not-checked"
+PEAK_ACTIVE=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 note() { printf '%s\n' "$*"; }
@@ -26,6 +30,8 @@ heading() { printf '\n== %s ==\n' "$*"; }
 usage() {
     cat <<'EOF'
 Usage:
+  smtp-egress-audit
+  smtp-egress-audit interactive
   smtp-egress-audit audit
   smtp-egress-audit report
   smtp-egress-audit watch [seconds]
@@ -34,6 +40,9 @@ Usage:
   smtp-egress-audit --version
 
 Read-only audit and monitoring of outbound SMTP connections.
+
+Run without arguments in a terminal to open the interactive provider-alert
+assistant. Existing commands remain suitable for automation and systemd.
 
 Environment:
   LOG_ROOT=/var/log/smtp-egress-audit  SMTP_PORT=25
@@ -44,15 +53,15 @@ EOF
 }
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_uint() { [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]; }
 is_positive_number() { [[ "$1" =~ ^([0-9]+)([.][0-9]+)?$ ]] && awk -v n="$1" 'BEGIN { exit !(n > 0) }'; }
 
 validate_environment() {
     if ! is_uint "$SMTP_PORT" || (( SMTP_PORT < 1 || SMTP_PORT > 65535 )); then
-        die "SMTP_PORT must be an integer from 1 to 65535"
+        die "SMTP_PORT must be a decimal integer from 1 to 65535 without leading zeroes"
     fi
     is_positive_number "$SAMPLE_INTERVAL" || die "SAMPLE_INTERVAL must be a positive number"
-    is_uint "$ACTIVE_THRESHOLD" || die "ACTIVE_THRESHOLD must be a non-negative integer"
+    is_uint "$ACTIVE_THRESHOLD" || die "ACTIVE_THRESHOLD must be a non-negative decimal integer without leading zeroes"
     [[ "$RESOLVE_HOSTNAMES" == 0 || "$RESOLVE_HOSTNAMES" == 1 ]] || die "RESOLVE_HOSTNAMES must be 0 or 1"
     [[ -n "$SINCE" && "$SINCE" != *$'\n'* ]] || die "SINCE must be a non-empty single-line value"
     [[ "$INTERFACE" =~ ^[[:alnum:]_.:@-]+$ ]] || die "INTERFACE contains invalid characters"
@@ -61,7 +70,7 @@ validate_environment() {
 
 validate_duration() {
     if ! is_uint "$1" || (( $1 < 1 || $1 > 604800 )); then
-        die "watch duration must be an integer from 1 to 604800 seconds"
+        die "watch duration must be a decimal integer from 1 to 604800 seconds without leading zeroes"
     fi
 }
 
@@ -104,9 +113,145 @@ extract_dovecot_success() {
 postqueue_count() {
     awk '
       /Mail queue is empty/ { empty=1 }
-      /^[A-F0-9*!]+[[:space:]]/ { n++ }
+      /^[[:alnum:]]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ { n++ }
       END { if (empty) print 0; else print n+0 }
     '
+}
+
+watch_duration_for_choice() {
+    case "$1" in
+        s|skip) printf '0\n' ;;
+        1) printf '60\n' ;;
+        2) printf '300\n' ;;
+        3|'') printf '600\n' ;;
+        4) printf '1800\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+history_window_for_choice() {
+    case "$1" in
+        1) printf '1 hour ago\n' ;;
+        2) printf '6 hours ago\n' ;;
+        3|'') printf '24 hours ago\n' ;;
+        4) printf '7 days ago\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+is_mta_process() {
+    case "${1,,}" in
+        smtp|smtp-*|postfix|postfix-*|qmgr|pickup|cleanup|anvil|bounce|defer|flush|lmtp|local|pipe|proxymap|scache|tlsmgr|trivial-rewrite|verify|virtual|sendmail|exim|exim4) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+classify_incident() {
+    local syn_count="$1" capture_status="$2" socket_rows="$3" mta_rows="$4" other_rows="$5"
+    local sent_count="$6" deferred_count="$7" queue_count="$8"
+    local traffic_observed=0
+    (( syn_count > 0 || socket_rows > 0 || mta_rows > 0 || other_rows > 0 )) && traffic_observed=1
+
+    if (( other_rows > 0 )); then
+        printf 'NON_MTA_PROCESS\n'
+    elif (( traffic_observed && mta_rows > 0 && deferred_count > 0 && deferred_count > sent_count && queue_count > 0 )); then
+        printf 'RETRY_STORM\n'
+    elif (( traffic_observed )); then
+        if (( mta_rows > 0 )); then
+            printf 'MAIL_ACTIVITY\n'
+        else
+            printf 'UNKNOWN_OWNER\n'
+        fi
+    elif [[ "$capture_status" != ready ]]; then
+        printf 'LIMITED_VISIBILITY\n'
+    else
+        printf 'QUIET\n'
+    fi
+}
+
+interactive_available() { [[ -t 0 && -t 1 ]]; }
+
+running_as_root() {
+    local effective_uid="${EUID:-}"
+    [[ -n "$effective_uid" ]] || effective_uid="$(id -u)"
+    (( effective_uid == 0 ))
+}
+
+count_socket_rows() { awk 'NF >= 5 && $1 !~ /^--/ && $4 ~ /:/ && $5 ~ /:/ {n++} END{print n+0}'; }
+
+format_duration() {
+    case "$1" in
+        0) printf 'skipped\n' ;;
+        60) printf '1 min\n' ;;
+        300) printf '5 min\n' ;;
+        600) printf '10 min\n' ;;
+        1800) printf '30 min\n' ;;
+        *) printf '%ss\n' "$1" ;;
+    esac
+}
+
+check_socket_capture() {
+    if ! have ss; then
+        SOCKET_CAPTURE_STATUS="missing"
+    elif ss -Htanp >/dev/null 2>"$RUN_DIR/ss.stderr"; then
+        SOCKET_CAPTURE_STATUS="ready"
+    else
+        SOCKET_CAPTURE_STATUS="failed"
+    fi
+}
+
+prompt_incident_port() {
+    local value
+    while true; do
+        printf 'Destination SMTP port [25]: ' >&2
+        if ! IFS= read -r value; then return 1; fi
+        case "${value,,}" in q|quit|в|выход) return 2 ;; esac
+        value="${value:-25}"
+        if is_uint "$value" && (( value >= 1 && value <= 65535 )); then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        warn "enter a port from 1 to 65535"
+    done
+}
+
+prompt_watch_duration() {
+    local choice duration
+    while true; do
+        note "Observation time:" >&2
+        note "  1) 1 minute   2) 5 minutes   3) 10 minutes (recommended)   4) 30 minutes   s) skip" >&2
+        printf 'Choice [3]: ' >&2
+        if ! IFS= read -r choice; then return 1; fi
+        case "${choice,,}" in q|quit|в|выход) return 2 ;; esac
+        if duration="$(watch_duration_for_choice "$choice")"; then
+            printf '%s\n' "$duration"
+            return 0
+        fi
+        warn "choose 1, 2, 3, 4, or s"
+    done
+}
+
+prompt_history_window() {
+    local choice window
+    while true; do
+        note "Log history:" >&2
+        note "  1) 1 hour   2) 6 hours   3) 24 hours (recommended)   4) 7 days" >&2
+        printf 'Choice [3]: ' >&2
+        if ! IFS= read -r choice; then return 1; fi
+        case "${choice,,}" in q|quit|в|выход) return 2 ;; esac
+        if window="$(history_window_for_choice "$choice")"; then
+            printf '%s\n' "$window"
+            return 0
+        fi
+        warn "choose 1, 2, 3, or 4"
+    done
+}
+
+confirm_investigation() {
+    local reply
+    printf 'Start read-only investigation? [Y/n]: ' >&2
+    if ! IFS= read -r reply; then return 1; fi
+    case "${reply,,}" in ''|y|yes|д|да) return 0 ;; *) return 1 ;; esac
 }
 
 init_run() {
@@ -141,7 +286,7 @@ service_summary() {
 }
 
 collect_journal_or_file() {
-    local kind="$1" output="$2" data=""
+    local kind="$1" output="$2" data="" scope_file="${2}.scope"
     if have journalctl; then
         case "$kind" in
             mail) data="$(journalctl --since "$SINCE" --no-pager -o short-iso -u postfix -u dovecot 2>/dev/null || true)" ;;
@@ -155,14 +300,16 @@ collect_journal_or_file() {
     esac
     if (( relevant )); then
         printf '%s\n' "$data" >"$output"
+        printf 'bounded\n' >"$scope_file"
         return
     fi
     local candidate
     case "$kind" in
-        mail) for candidate in /var/log/mail.log /var/log/maillog; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; return; }; done ;;
-        auth) for candidate in /var/log/auth.log /var/log/secure; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; return; }; done ;;
+        mail) for candidate in /var/log/mail.log /var/log/maillog; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; printf 'unbounded-file\n' >"$scope_file"; return; }; done ;;
+        auth) for candidate in /var/log/auth.log /var/log/secure; do [[ -r "$candidate" ]] && { cp -- "$candidate" "$output"; printf 'unbounded-file\n' >"$scope_file"; return; }; done ;;
     esac
     : >"$output"
+    printf 'unavailable\n' >"$scope_file"
     note "$kind logs: unavailable for SINCE=$SINCE"
 }
 
@@ -197,7 +344,7 @@ print_login_rows_with_ptr() {
 }
 
 postfix_report() {
-    local log="$1" queue_file="$RUN_DIR/postqueue.txt"
+    local log="$1" queue_file="$RUN_DIR/postqueue.txt" queue_status="$RUN_DIR/postqueue.status"
     heading "Postfix delivery summary"
     printf 'status=sent:     %s\n' "$(count_postfix_status sent <"$log")"
     printf 'status=deferred: %s\n' "$(count_postfix_status deferred <"$log")"
@@ -205,7 +352,20 @@ postfix_report() {
     printf 'queued messages: %s\n' "$(awk '/postfix\/(smtpd|pickup).*: [A-F0-9]+: (client=|uid=)/ {n++} END{print n+0}' "$log")"
 
     heading "Postfix queue"
-    if have postqueue; then postqueue -p >"$queue_file" 2>&1 || true; cat "$queue_file"; printf 'Queue entries counted: %s\n' "$(postqueue_count <"$queue_file")"; else note "postqueue: not installed"; fi
+    if have postqueue; then
+        if postqueue -p >"$queue_file" 2>&1; then
+            printf 'ready\n' >"$queue_status"
+            cat "$queue_file"
+            printf 'Queue entries counted: %s\n' "$(postqueue_count <"$queue_file")"
+        else
+            printf 'failed\n' >"$queue_status"
+            cat "$queue_file"
+            note "Postfix queue: unavailable or permission denied"
+        fi
+    else
+        printf 'missing\n' >"$queue_status"
+        note "postqueue: not installed"
+    fi
 
     heading "Recent delivery events (metadata only)"
     awk '/postfix\/smtp.*status=(sent|deferred|bounced)/ { print }' "$log" | tail -n 30 || true
@@ -351,10 +511,16 @@ cleanup_monitor() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    TCPDUMP_PID=""
+    BPF_PID=""
 }
+
+request_monitor_stop() { STOP_REQUESTED=1; }
 
 start_capture() {
     local iface="$1" capture="$RUN_DIR/tcpdump-syn.log" filter
+    CAPTURE_STATUS="not-started"
+    CAPTURE_PROCESS_SEEN=0
     filter="$(tcpdump_filter)"
     : >"$capture"
     if have tcpdump; then
@@ -378,6 +544,7 @@ start_capture() {
             done <<<"$addresses"
             if [[ -z "$source_filter" ]]; then
                 warn "tcpdump lacks -Q out and no local source addresses were found; refusing ambiguous capture"
+                CAPTURE_STATUS="direction-unavailable"
             else
                 filter="$filter and ($source_filter)"
                 note "tcpdump -Q out unsupported; local source-address BPF enforces outbound direction"
@@ -388,9 +555,11 @@ start_capture() {
             note "BPF: $filter"
             tcpdump "${args[@]}" "$filter" >"$capture" 2>"$RUN_DIR/tcpdump.stderr" &
             TCPDUMP_PID=$!
+            CAPTURE_STATUS="started"
         fi
     else
         note "tcpdump: not installed; SYN capture unavailable"
+        CAPTURE_STATUS="missing"
     fi
 
     if have tcpconnect-bpfcc; then
@@ -402,37 +571,88 @@ start_capture() {
     fi
 }
 
+monitor_capture_status() {
+    case "$CAPTURE_STATUS" in
+        started)
+            if (( CAPTURE_PROCESS_SEEN == 0 )) \
+                || [[ ! -f "$RUN_DIR/tcpdump-syn.log" ]] \
+                || { [[ -s "$RUN_DIR/tcpdump.stderr" ]] \
+                    && grep -Eqi 'permission denied|operation not permitted|no such device|syntax error|can.t parse|cannot open|failed|fatal|unknown data link|not supported' "$RUN_DIR/tcpdump.stderr"; }; then
+                printf 'failed\n'
+            else
+                printf 'ready\n'
+            fi
+            ;;
+        *) printf '%s\n' "$CAPTURE_STATUS" ;;
+    esac
+}
+
+observed_socket_processes() {
+    local snapshots="$RUN_DIR/ss-snapshots.log"
+    {
+        if [[ -s "$RUN_DIR/initial-sockets.log" ]]; then
+            sed -nE 's/.*users:\(\("([^"]+)".*pid=([0-9]+).*/\1 pid=\2/p' "$RUN_DIR/initial-sockets.log"
+        fi
+        if [[ -s "$snapshots" ]]; then
+            sed -nE 's/.*users:\(\("([^"]+)".*pid=([0-9]+).*/\1 pid=\2/p' "$snapshots"
+        fi
+        if [[ -s "$RUN_DIR/tcpconnect-bpfcc.log" ]]; then
+            awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[[:alnum:]_.:@+-]+$/ {print $2 " pid=" $1}' "$RUN_DIR/tcpconnect-bpfcc.log"
+        fi
+    } | sort | uniq -c | sort -nr || true
+}
+
 monitor_loop() {
-    local duration="${1:-}" iface start now active
+    local duration="${1:-}" summary_mode="${2:-full}" iface start now active syn_live threshold_warned=0
+    STOP_REQUESTED=0
+    TCPDUMP_PID=""
+    BPF_PID=""
+    PEAK_ACTIVE=0
     iface="$(detect_interface)"; [[ -n "$iface" ]] || iface=any
-    trap cleanup_monitor INT TERM EXIT
+    trap request_monitor_stop INT TERM
+    trap cleanup_monitor EXIT
     start_capture "$iface"
+    check_socket_capture
     : >"$RUN_DIR/ss-snapshots.log"
     start=$SECONDS
     while (( STOP_REQUESTED == 0 )); do
+        if [[ -n "$TCPDUMP_PID" ]] && kill -0 "$TCPDUMP_PID" 2>/dev/null; then CAPTURE_PROCESS_SEEN=1; fi
         now="$(date --iso-8601=seconds 2>/dev/null || date)"
-        if have ss; then
+        if [[ "$SOCKET_CAPTURE_STATUS" == ready ]]; then
             {
                 printf -- '-- %s --\n' "$now"
                 snapshot_ss
             } >>"$RUN_DIR/ss-snapshots.log"
             active="$(snapshot_ss | awk 'NF {n++} END{print n+0}')"
-            if (( active > ACTIVE_THRESHOLD )); then warn "$active active connections to destination port $SMTP_PORT exceed threshold $ACTIVE_THRESHOLD"; fi
+            (( active > PEAK_ACTIVE )) && PEAK_ACTIVE="$active"
+            if (( active > ACTIVE_THRESHOLD && threshold_warned == 0 )); then
+                warn "$active active connections to destination port $SMTP_PORT exceed threshold $ACTIVE_THRESHOLD (shown once; peak is reported at the end)"
+                threshold_warned=1
+            fi
         else
             active=0
         fi
-        printf '\r%s active=%s elapsed=%ss' "$now" "$active" "$((SECONDS-start))"
+        syn_live="$(awk 'NF {n++} END{print n+0}' "$RUN_DIR/tcpdump-syn.log" 2>/dev/null || echo 0)"
+        if [[ "$summary_mode" == compact && -w /dev/tty ]]; then
+            printf '\r%s active=%s syn=%s elapsed=%ss' "$now" "$active" "${syn_live:-0}" "$((SECONDS-start))" >/dev/tty
+        else
+            printf '\r%s active=%s syn=%s elapsed=%ss' "$now" "$active" "${syn_live:-0}" "$((SECONDS-start))"
+        fi
         if [[ -n "$duration" ]] && (( SECONDS - start >= duration )); then break; fi
-        sleep "$SAMPLE_INTERVAL"
+        if ! sleep "$SAMPLE_INTERVAL"; then STOP_REQUESTED=1; fi
     done
-    printf '\n'
+    if [[ "$summary_mode" == compact && -w /dev/tty ]]; then printf '\n' >/dev/tty; else printf '\n'; fi
     cleanup_monitor
     trap - INT TERM EXIT
-    monitor_summary
+    if [[ "$summary_mode" == full ]]; then
+        monitor_summary
+    else
+        monitor_summary >"$RUN_DIR/network-summary.txt" 2>&1
+    fi
 }
 
 monitor_summary() {
-    local capture="$RUN_DIR/tcpdump-syn.log"
+    local capture="$RUN_DIR/tcpdump-syn.log" processes
     heading "Network monitoring summary"
     if [[ -s "$capture" ]]; then
         printf 'Outbound SYN observed: %s\n' "$(awk 'NF {n++} END{print n+0}' "$capture")"
@@ -442,8 +662,9 @@ monitor_summary() {
         note "Outbound SYN observed: 0 (or tcpdump unavailable/insufficient privileges)"
     fi
     note "Observed socket processes:"
-    if [[ -s "$RUN_DIR/ss-snapshots.log" ]]; then
-        sed -nE 's/.*users:\(\("([^"]+)".*pid=([0-9]+).*/\1 pid=\2/p' "$RUN_DIR/ss-snapshots.log" | sort | uniq -c | sort -nr || true
+    processes="$(observed_socket_processes)"
+    if [[ -n "$processes" ]]; then
+        printf '%s\n' "$processes"
     else
         note "none"
     fi
@@ -463,13 +684,176 @@ run_report() {
     note "sasl_username identifies the authenticated mail account."
 }
 
+evidence_coverage() {
+    local capture_status="$1" sockets_available="$2" mail_available="$3"
+    if [[ "$capture_status" == ready && "$sockets_available" == 1 && "$mail_available" == 1 ]]; then
+        printf 'FULL\n'
+    elif [[ "$capture_status" == ready || "$sockets_available" == 1 || "$mail_available" == 1 ]]; then
+        printf 'PARTIAL\n'
+    else
+        printf 'MINIMAL\n'
+    fi
+}
+
+incident_summary() {
+    local capture_status syn_count socket_rows mta_rows=0 other_rows=0 sent_count deferred_count bounced_count
+    local queue_count=-1 queue_display="unavailable" process_rows process_line coverage verdict label explanation next_step
+    local sockets_available=0 mail_available=0 destination_count=0 mail_scope="unknown" queue_status="unknown"
+    local classification_deferred=0
+
+    capture_status="$(monitor_capture_status)"
+    syn_count="$(awk 'NF {n++} END{print n+0}' "$RUN_DIR/tcpdump-syn.log" 2>/dev/null || echo 0)"
+    socket_rows="$({
+        count_socket_rows <"$RUN_DIR/initial-sockets.log" 2>/dev/null
+        count_socket_rows <"$RUN_DIR/ss-snapshots.log" 2>/dev/null
+    } | awk '{n+=$1} END{print n+0}')"
+    [[ "$SOCKET_CAPTURE_STATUS" == ready ]] && sockets_available=1
+    [[ -r "$RUN_DIR/mail.log.scope" ]] && IFS= read -r mail_scope <"$RUN_DIR/mail.log.scope"
+    [[ -s "$RUN_DIR/mail.log" && "$mail_scope" == bounded ]] && mail_available=1
+
+    sent_count="$(count_postfix_status sent <"$RUN_DIR/mail.log" 2>/dev/null || echo 0)"
+    deferred_count="$(count_postfix_status deferred <"$RUN_DIR/mail.log" 2>/dev/null || echo 0)"
+    bounced_count="$(count_postfix_status bounced <"$RUN_DIR/mail.log" 2>/dev/null || echo 0)"
+    [[ -r "$RUN_DIR/postqueue.status" ]] && IFS= read -r queue_status <"$RUN_DIR/postqueue.status"
+    if [[ "$queue_status" == ready && -s "$RUN_DIR/postqueue.txt" ]]; then
+        queue_count="$(postqueue_count <"$RUN_DIR/postqueue.txt")"
+        queue_display="$queue_count"
+    fi
+    [[ "$mail_scope" == bounded ]] && classification_deferred="$deferred_count"
+    if [[ -s "$RUN_DIR/tcpdump-syn.log" ]]; then
+        destination_count="$(awk '/ > / {dest=$5; sub(/:$/, "", dest); print dest}' "$RUN_DIR/tcpdump-syn.log" | sort -u | awk 'NF {n++} END{print n+0}')"
+    fi
+
+    process_rows="$(observed_socket_processes)"
+    while read -r count process_line _; do
+        [[ "$count" =~ ^[0-9]+$ && -n "${process_line:-}" ]] || continue
+        if is_mta_process "$process_line"; then
+            mta_rows=$((mta_rows + count))
+        else
+            other_rows=$((other_rows + count))
+        fi
+    done <<<"$process_rows"
+
+    coverage="$(evidence_coverage "$capture_status" "$sockets_available" "$mail_available")"
+    verdict="$(classify_incident "$syn_count" "$capture_status" "$socket_rows" "$mta_rows" "$other_rows" "$sent_count" "$classification_deferred" "$queue_count")"
+    case "$verdict" in
+        NON_MTA_PROCESS)
+            label="NON-MAIL PROCESS NEEDS ATTENTION"
+            explanation="A process outside the recognized mail transport set owned SMTP sockets. Confirm the application or container immediately."
+            next_step="Review the process path, parent process, user, container, and matching timestamps before containment."
+            ;;
+        RETRY_STORM)
+            label="POSSIBLE POSTFIX RETRY ACTIVITY"
+            explanation="A recognized mail process was observed and deferred deliveries dominate the selected log window."
+            next_step="Inspect deferred reasons, destinations, queue age, and compare the exact interval with the provider alert."
+            ;;
+        MAIL_ACTIVITY)
+            label="MAIL TRAFFIC OBSERVED"
+            explanation="A recognized mail process appeared in live socket evidence; short-lived SYN attempts may remain unattributed and expected volume is not proven."
+            next_step="Compare destination counts, authenticated users, and provider timestamps with normal server traffic."
+            ;;
+        UNKNOWN_OWNER)
+            label="OUTBOUND SMTP OWNER NOT ATTRIBUTED"
+            explanation="SMTP traffic was observed, but the short-lived connection owner was not identified."
+            next_step="Repeat a longer watch and install tcpconnect-bpfcc if stronger process attribution is required."
+            ;;
+        LIMITED_VISIBILITY)
+            label="EVIDENCE INCOMPLETE"
+            explanation="Packet capture was skipped or unavailable and no live SMTP socket was preserved."
+            next_step="Run again as root with tcpdump and ss available, ideally while the provider event is active."
+            ;;
+        *)
+            label="TRAFFIC NOT REPRODUCED"
+            explanation="No outbound SMTP connection appeared during this observation window; an earlier event is still possible."
+            next_step="Compare the window with the provider timestamp and repeat during the reported activity period."
+            ;;
+    esac
+
+    {
+        heading "Investigation complete"
+        printf 'Assessment: %s\n' "$label"
+        note "$explanation"
+        printf 'Window: logs=%s | live=%s | port=%s\n' "$SINCE" "$(format_duration "${INCIDENT_WATCH_SECONDS:-0}")" "$SMTP_PORT"
+        printf 'Network: SYN=%s | peak-active=%s | destinations=%s | capture=%s\n' "$syn_count" "$PEAK_ACTIVE" "$destination_count" "$capture_status"
+        if [[ -n "$process_rows" ]]; then
+            printf 'Processes: '
+            awk 'NR <= 3 {printf "%s%s(%s, samples=%s)", (NR>1 ? "; " : ""), $2, $3, $1} END {if (NR>3) printf "; +%d more", NR-3; print ""}' <<<"$process_rows"
+        else
+            note "Processes: none attributed"
+        fi
+        printf 'Postfix: sent=%s | deferred=%s | bounced=%s | queue=%s | log-scope=%s\n' "$sent_count" "$deferred_count" "$bounced_count" "$queue_display" "$mail_scope"
+        if [[ "$mail_scope" == unbounded-file ]]; then
+            note "Log note: traditional file fallback was not time-bounded; its counts did not affect retry classification."
+        fi
+        printf 'Coverage: %s\n' "$coverage"
+        printf 'Next: %s\n' "$next_step"
+        printf 'Private evidence directory: %s\n' "$RUN_DIR"
+        note "Safety: no firewall, service, queue, account, or mail configuration was changed."
+    } | tee "$RUN_DIR/assessment.txt"
+}
+
+interactive_wizard() (
+    local port history_window duration
+    interactive_available || die "interactive mode requires a terminal; use audit, report, watch, or monitor for automation"
+    running_as_root || die "interactive investigation needs root access; rerun: sudo smtp-egress-audit interactive"
+
+    printf '\n%s %s\n' "$PROGRAM" "$VERSION"
+    note "Provider SMTP alert investigation"
+    note "Read-only checks; only private metadata reports are written."
+    note "Enter q at a prompt to cancel."
+    printf '\n'
+
+    if ! port="$(prompt_incident_port)"; then note "Cancelled; no report was created."; return 0; fi
+    if ! history_window="$(prompt_history_window)"; then note "Cancelled; no report was created."; return 0; fi
+    if ! duration="$(prompt_watch_duration)"; then note "Cancelled; no report was created."; return 0; fi
+
+    printf '\nPlan: TCP/%s | logs: %s | live: %s\n' "$port" "$history_window" "$(format_duration "$duration")"
+    if ! confirm_investigation; then note "Cancelled; no report was created."; return 0; fi
+
+    SMTP_PORT="$port"
+    SINCE="$history_window"
+    INCIDENT_WATCH_SECONDS="$duration"
+    validate_environment
+    init_run incident
+    check_socket_capture
+    if [[ "$SOCKET_CAPTURE_STATUS" == ready ]]; then snapshot_ss >"$RUN_DIR/initial-sockets.log" 2>&1 || true; else : >"$RUN_DIR/initial-sockets.log"; fi
+
+    if (( duration > 0 )); then
+        note "[1/3] Capturing volatile network state on TCP/$SMTP_PORT"
+        note "Press Ctrl+C to finish observation early and continue building the report."
+        monitor_loop "$duration" compact
+        note "[1/3] Network observation complete."
+    else
+        CAPTURE_STATUS="skipped"
+        PEAK_ACTIVE=0
+        : >"$RUN_DIR/tcpdump-syn.log"
+        : >"$RUN_DIR/ss-snapshots.log"
+        note "[1/3] Live capture skipped; an immediate socket snapshot was saved."
+    fi
+
+    trap 'warn "Collection interrupted. Partial evidence: $RUN_DIR"; exit 130' INT TERM
+    note "[2/3] Preserving system context..."
+    system_audit >"$RUN_DIR/system-audit.txt" 2>&1
+    note "[2/3] System context saved."
+    note "[3/3] Reading Postfix and login history..."
+    run_report >"$RUN_DIR/evidence-report.txt" 2>&1
+    note "[3/3] Historical evidence saved."
+    incident_summary
+    trap - INT TERM
+)
+
 main() {
     umask 077
     validate_environment
-    (( $# >= 1 )) || { usage; exit 2; }
+    if (( $# == 0 )); then
+        if interactive_available; then interactive_wizard; return; fi
+        usage
+        exit 2
+    fi
     case "$1" in
         --help|-h) (( $# == 1 )) || die "--help takes no arguments"; usage ;;
         --version|-V) (( $# == 1 )) || die "--version takes no arguments"; printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+        interactive) (( $# == 1 )) || die "interactive takes no arguments"; interactive_wizard ;;
         audit) (( $# == 1 )) || die "audit takes no arguments"; init_run audit; system_audit; run_report ;;
         report) (( $# == 1 )) || die "report takes no arguments"; init_run report; run_report ;;
         watch) (( $# <= 2 )) || die "watch accepts at most one duration"; local duration="${2:-600}"; validate_duration "$duration"; init_run watch; monitor_loop "$duration" ;;

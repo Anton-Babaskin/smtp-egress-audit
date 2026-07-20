@@ -1,10 +1,23 @@
 # smtp-egress-audit
 
+## Quick Start
+
+Provider reported excessive outbound TCP/25 connections? Install and start the guided read-only investigation:
+
+```bash
+git clone https://github.com/Anton-Babaskin/smtp-egress-audit.git
+cd smtp-egress-audit
+sudo ./install.sh
+sudo smtp-egress-audit
+```
+
+The assistant asks for the port, log window, and observation time, then prints a compact assessment and the private evidence directory. It does not block addresses, stop services, or change mail configuration.
+
 `smtp-egress-audit` is a read-only Bash tool for investigating abnormal outbound SMTP connection alerts on Linux servers. It correlates outbound TCP SYN metadata, active sockets and owning processes, Postfix delivery records, authenticated mail users, SSH/Dovecot logins, queues, services, scheduled jobs, containers, and relevant configuration.
 
 The tool never changes firewall, Postfix, SSH, or Fail2ban configuration; never blocks an address; and never captures packet payloads or message bodies.
 
-Version: **1.1.0** · License: MIT · [Русская документация](docs/README.ru.md)
+Version: **1.2.0** · License: MIT · [Русская документация](docs/README.ru.md)
 
 ## Supported systems and requirements
 
@@ -33,6 +46,28 @@ Continuous monitoring is not started automatically. To opt in during installatio
 sudo ./install.sh --enable-monitor
 ```
 
+## Interactive provider-alert assistant
+
+For the common case where a hosting provider reports unusually many outbound connections to TCP/25, run the guided assistant:
+
+```bash
+sudo smtp-egress-audit
+# or explicitly:
+sudo smtp-egress-audit interactive
+```
+
+The interactive assistant requires root so it can read journals and attribute packets and PIDs completely. It asks only for the destination SMTP port, historical log window, and bounded live-observation time. It then:
+
+1. starts preserving volatile socket and SYN metadata;
+2. collects system, Postfix, queue, authentication, job, and container context;
+3. prints a compact, cautious assessment and the private report location.
+
+The assessment distinguishes recognized mail traffic, possible Postfix retry activity, a non-mail process that needs attention, traffic without process attribution, an event not reproduced during a healthy capture, and incomplete evidence. It never labels a server “safe” merely because no connection appeared during a short observation.
+
+If journald has no relevant records and the tool falls back to a traditional log file, the summary labels that source `unbounded-file`. Those counts remain visible for context but are not used to claim retry activity for the selected time window.
+
+Detailed output stays in private files below the run directory instead of overwhelming the terminal. Choosing to skip live capture still preserves an immediate socket snapshot. Ctrl+C ends the live observation early and continues building the report. The wizard remains read-only and requires a real terminal; automation and systemd should continue using the explicit commands below.
+
 ## Commands
 
 ```bash
@@ -44,6 +79,7 @@ sudo SINCE="7 days ago" smtp-egress-audit report
 sudo SMTP_PORT=587 smtp-egress-audit watch 600
 ```
 
+- `interactive`: guided, compact investigation of a provider SMTP alert; also starts automatically with no arguments in a terminal.
 - `audit`: full one-time system and historical-log audit.
 - `report`: historical Postfix, SSH, SMTP authentication, IMAP, and POP3 report.
 - `watch [seconds]`: bounded observation, default 600 seconds, maximum 7 days.
